@@ -21,9 +21,11 @@ fi
 # Detect whether we're targeting the local Ollama platform (default). The
 # ollama-specific preamble is skipped for openai/fastflowllm platforms.
 PLATFORM="ollama"
+BASE_URL=""
 prev=""
 for i in "$@"; do
   [[ "$prev" == "--platform" ]] && PLATFORM="$i"
+  [[ "$prev" == "--base-url" ]] && BASE_URL="$i"
   prev="$i"
 done
 
@@ -35,6 +37,25 @@ if [[ "$PLATFORM" == "ollama" ]]; then
     echo "        Start it with:  ollama serve" >&2
     exit 1
   fi
+fi
+
+EXTRA_ARGS=()
+if [[ "$PLATFORM" == "fastflowllm" && -z "$BASE_URL" ]]; then
+  # FLM's server port is host-specific (set via FLM_PORT/config, not fixed
+  # like Ollama's 11434) and *can* collide with an Ollama instance sitting on
+  # the hardcoded backend default. Auto-detect it via `flm port` instead of
+  # silently querying whatever happens to be on the default port.
+  if ! command -v flm >/dev/null 2>&1; then
+    echo "[error] --platform fastflowllm needs the 'flm' CLI on PATH (or pass --base-url explicitly)." >&2
+    exit 1
+  fi
+  FLM_PORT="$(flm port 2>/dev/null | grep -oP '(?<=Server Port: )\d+')"
+  if [[ -z "$FLM_PORT" ]]; then
+    echo "[error] could not detect FLM's server port via 'flm port'. Pass --base-url explicitly." >&2
+    exit 1
+  fi
+  echo "[run] auto-detected FLM base URL: http://localhost:${FLM_PORT}/v1"
+  EXTRA_ARGS+=(--base-url "http://localhost:${FLM_PORT}/v1")
 fi
 
 mkdir -p "$ROOT/results"
@@ -50,7 +71,7 @@ fi
 
 echo "[run] writing results to $OUT"
 PYTHONPATH="$ROOT/src" "$VENV/bin/python" -m ollama_benchmark \
-  --out "$OUT" --host "$HOST" "$@"
+  --out "$OUT" --host "$HOST" "${EXTRA_ARGS[@]}" "$@"
 
 # Refresh a stable 'latest' symlink for convenience.
 ln -sf "$(basename "$OUT")" "$ROOT/results/latest.jsonl"

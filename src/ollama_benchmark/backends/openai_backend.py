@@ -104,7 +104,12 @@ class OpenAIBackend(Backend):
                 if chunk.get("usage"):
                     usage = chunk["usage"]
                 for choice in chunk.get("choices", []):
-                    piece = (choice.get("delta") or {}).get("content")
+                    delta = choice.get("delta") or {}
+                    # Reasoning models (deepseek-r1, qwen3, ...) stream their
+                    # output in `reasoning_content` and leave `content` empty
+                    # until (if ever) they finish thinking — fall back to it
+                    # so the reply/tok-count aren't silently empty for them.
+                    piece = delta.get("content") or delta.get("reasoning_content")
                     if piece:
                         yield {"text": piece}
         yield {"final": {"usage": usage}}

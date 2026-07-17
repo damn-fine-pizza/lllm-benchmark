@@ -170,7 +170,8 @@ def sample_npu() -> dict:
     Uses ``xrt-smi`` (AMD XDNA / Ryzen AI). Unlike ``rocm-smi``/``nvidia-smi``,
     xrt-smi exposes no VRAM, temperature or utilization for the NPU — only an
     ``Estimated Power`` figure (Watts), and only on Strix (STX) NPUs and newer.
-    Keyed ``card0`` like the GPU samplers, for a consistent shape downstream.
+    Keyed ``npu0`` (distinct from the GPU samplers' ``card0``) so an NPU
+    reading never collides with — or overwrites — a real GPU card's panel.
     """
     if not XRT_SMI:
         return {}
@@ -186,7 +187,7 @@ def sample_npu() -> dict:
     match = _XRT_POWER_RE.search(out.stdout)
     if not match:
         return {}
-    return {"card0": {
+    return {"npu0": {
         "vram_used_b": None,
         "vram_total_b": None,
         "power_w": _to_float(match.group(1)),
