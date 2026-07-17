@@ -63,6 +63,7 @@ def benchmark_model(backend: Backend, model: dict, reporter: Reporter, *,
         "cpu": None,
         "kv_cache_mb": None,  # vram_delta - disk ≈ KV cache footprint
         "performance": {},
+        "reply": None,
         "ok": False,
         "error": None,
     }
@@ -113,10 +114,12 @@ def _run_completion(backend, name, record, sampler, reporter, num_predict,
     t0 = time.perf_counter()
     raw: dict = {}
     streamed = 0
+    reply_parts: list[str] = []
     for ev in backend.stream(name, prompt, num_predict, num_ctx):
         piece = ev.get("text")
         if piece:
             reporter.token(piece)
+            reply_parts.append(piece)
             streamed += 1
         if "final" in ev:
             raw = ev["final"] or {}
@@ -129,6 +132,7 @@ def _run_completion(backend, name, record, sampler, reporter, num_predict,
         record["gpu"] = stats.as_dict()
         record["cpu"] = stats.cpu_dict()
     record["performance"] = backend.performance(raw, wall, streamed)
+    record["reply"] = "".join(reply_parts)
 
 
 def _run_embedding(backend, name, record, sampler, reporter, num_ctx=None) -> None:

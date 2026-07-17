@@ -51,6 +51,7 @@ class PlainReporter(Reporter):
     def __init__(self):
         self._total = 0
         self._idx = 0
+        self._streaming = False
 
     def run_start(self, total: int, card: str) -> None:
         self._total = total
@@ -59,18 +60,40 @@ class PlainReporter(Reporter):
     def model_start(self, meta: dict) -> None:
         self._idx += 1
         print(f"[{self._idx}/{self._total}] {meta['model']} ...", flush=True)
+        self._streaming = False
+
+    def token(self, text: str) -> None:
+        # Stream the generated text live so plain/log output shows the same
+        # response Ollama's rich dashboard previews, just line-oriented.
+        if not self._streaming:
+            print("    > ", end="", flush=True)
+            self._streaming = True
+        print(text, end="", flush=True)
 
     def model_done(self, record: dict) -> None:
+        if self._streaming:
+            print()  # close the streamed-response line
+            self._streaming = False
         perf = record.get("performance") or {}
         gpu = record.get("gpu") or {}
+        cpu = record.get("cpu") or {}
         if record["ok"]:
+            # NPU backends (e.g. fastflowllm) expose no VRAM via xrt-smi — they
+            # share system RAM instead, so fall back to ram_delta when VRAM is
+            # unavailable rather than printing a meaningless "vram_delta=None".
+            if gpu.get("vram_delta_mb") is not None:
+                mem = f"vram_delta={gpu['vram_delta_mb']}MB"
+            elif cpu.get("ram_delta_mb") is not None:
+                mem = f"ram_delta={cpu['ram_delta_mb']}MB"
+            else:
+                mem = "mem=n/d"
             if record["workload"] == "completion":
                 print(f"    ok  {perf.get('tokens_per_s')} tok/s"
-                      f"  vram_delta={gpu.get('vram_delta_mb')}MB"
+                      f"  {mem}"
                       f"  peak_power={gpu.get('power_peak_w')}W")
             else:
                 print(f"    ok  embedding_dim={perf.get('embedding_dim')}"
-                      f"  vram_delta={gpu.get('vram_delta_mb')}MB")
+                      f"  {mem}")
         else:
             print(f"    FAIL: {record['error']}")
 
@@ -96,6 +119,7 @@ COLUMNS = [
     Col("temp",      "°C",        "H", True,  "right", None),
     Col("load_s",    "load s",    "L", True,  "right", None),
     Col("caps",      "caps",      "S", False, "left",  "dim"),
+    Col("reply",     "reply",     "E", False, "left",  "dim"),
 ]
 _COL_BY_KEY = {c.key: c for c in COLUMNS}
 
@@ -108,6 +132,13 @@ def _fmt(v, suffix="", nd=1):
     if v is None:
         return "-"
     return f"{v:.{nd}f}{suffix}"
+
+
+def _preview_text(text, length):
+    if not text:
+        return "-"
+    flat = " ".join(text.split())
+    return flat if len(flat) <= length else flat[:length] + "…"
 
 
 def _to_int(v):
@@ -236,6 +267,7 @@ class _Dashboard:
         self.cur_placement: dict | None = None
         self.cur_status = "starting"
         self.cur_kv_mb: float | None = None
+        self.cur_start: float | None = None
 
         # live generation
         self.tok_count = 0
@@ -287,6 +319,7 @@ class _Dashboard:
         self.cur_placement = None
         self.cur_status = "loading"
         self.cur_kv_mb = None
+        self.cur_start = time.perf_counter()
         self.tok_count = 0
         self.first_token_t = None
         self.preview.clear()
@@ -350,6 +383,7 @@ class _Dashboard:
             "load_s": perf.get("load_duration_s"),
             "ok": record["ok"],
             "caps": ",".join(record.get("capabilities") or []),
+            "reply": _preview_text(record.get("reply"), 60),
         })
         self.cur_kv_mb = record.get("kv_cache_mb")
         self.cur_status = "done"
@@ -415,6 +449,20 @@ class _Dashboard:
         s = int(time.perf_counter() - self.start)
         return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
+    def _cur_elapsed(self) -> str:
+        if self.cur_start is None:
+            return "00:00"
+        s = int(time.perf_counter() - self.cur_start)
+        return f"{s // 60:02d}:{s % 60:02d}"
+
+    def _visible_columns(self) -> list[Col]:
+        # No rocm-smi/nvidia-smi means the sampler is NPU-only (e.g. xrt-smi):
+        # vram/temp are never populated there, so drop the perpetually-empty
+        # columns instead of showing "-" down the whole table.
+        if self.local_metrics and self.gpu_vendor is None:
+            return [c for c in COLUMNS if c.id not in ("vram_mb", "temp")]
+        return COLUMNS
+
     def _sorted_rows(self) -> list[dict]:
         if not self.sort_key:
             return self.rows
@@ -447,18 +495,23 @@ class _Dashboard:
             Layout(name="mid", size=15),
             Layout(self._summary(), name="summary"),
         )
-        # Top row: current | cpu | gpu0 | gpu1 | ...  The cpu and gpu panels are
-        # fixed-width; the current-model panel is flexible and absorbs any extra
-        # width (no empty gap on the right). Only the completed table (below)
-        # grows vertically / scrolls.
+        # Top row: current | cpu | npu0 | ... | gpu0 | gpu1 | ...  The cpu, npu
+        # and gpu panels are fixed-width; the current-model panel is flexible
+        # and absorbs any extra width (no empty gap on the right). Only the
+        # completed table (below) grows vertically / scrolls.
         cards = self.known_cards or list((self.live.get("cards") or {}).keys())
         if not self.local_metrics:
             cards = ["card0"]  # single placeholder panel showing n/d
+        npu_cards = sorted(c for c in cards if c.startswith("npu"))
+        gpu_cards = sorted(c for c in cards if not c.startswith("npu")) or (
+            [] if npu_cards else ["card0"])
         children = [
             Layout(self._current_panel(), name="current", ratio=1, minimum_size=48),
             Layout(self._cpu_panel(), name="cpu", size=32),
         ]
-        for card in (sorted(cards) or ["card0"]):
+        for card in npu_cards:
+            children.append(Layout(self._gpu_panel(card), name=card, size=40))
+        for card in gpu_cards:
             children.append(Layout(self._gpu_panel(card), name=card, size=40))
         layout["mid"].split_row(*children)
         return layout
@@ -503,7 +556,13 @@ class _Dashboard:
                          f"  ({self.cur_placement.get('size','?')})")
         live_tps = self._live_tok_s()
         meta.add_row("model", f"[bold yellow]{self.cur_name}[/]")
-        meta.add_row("status", _status_text(self.cur_status))
+        status_label = f"{_status_text(self.cur_status)}  [dim]{self._cur_elapsed()}[/]"
+        if self.cur_status in ("loading", "generating"):
+            from rich.spinner import Spinner
+            status_cell = Spinner("dots", text=status_label)
+        else:
+            status_cell = status_label
+        meta.add_row("status", status_cell)
         meta.add_row("caps", ",".join(self.cur_caps) or "-")
         meta.add_row("params", f"{d.get('parameter_size') or '-'}"
                      f"  {d.get('quantization_level') or ''}")
@@ -546,17 +605,31 @@ class _Dashboard:
         from rich.progress_bar import ProgressBar
         from rich.console import Group
 
+        is_npu = card.startswith("npu")
+        icon = "🧠" if is_npu else "🎮"
+        color = "green" if is_npu else "magenta"
+
         if not self.local_metrics:
-            return self._nd_panel("🎮 GPU", ["VRAM", "power", "temp", "util"],
-                                  "magenta")
+            rows = ["power"] if is_npu else ["VRAM", "power", "temp", "util"]
+            return self._nd_panel(f"{icon} NPU" if is_npu else f"{icon} GPU",
+                                  rows, color)
 
         g = (self.live.get("cards") or {}).get(card) or {}
         peaks = self.card_peaks.get(card) or {}
-        used = g.get("vram_used_b")
-        total = g.get("vram_total_b")
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim", justify="right")
         t.add_column()
+
+        if is_npu:
+            # xrt-smi exposes power only for the NPU — no VRAM/temp/util, so
+            # showing those rows would just be permanent "-" clutter.
+            t.add_row("power", f"{_fmt(g.get('power_w'),' W')}"
+                      f"   peak {_fmt(peaks.get('power', 0),' W')}")
+            label = card.replace("npu", "NPU")
+            return Panel(t, title=f"{icon} {label}", border_style=color)
+
+        used = g.get("vram_used_b")
+        total = g.get("vram_total_b")
         t.add_row("VRAM", f"{_mb(used)} / {_mb(total)} MB")
         t.add_row("peak VRAM", f"{_mb(peaks.get('vram', 0))} MB")
         t.add_row("power", f"{_fmt(g.get('power_w'),' W')}"
@@ -566,11 +639,11 @@ class _Dashboard:
 
         frac = (used / total) if (used and total) else 0
         bar = ProgressBar(total=1.0, completed=frac, width=None,
-                          complete_style="magenta")
+                          complete_style=color)
         label = card.replace("card", "GPU")
         vend = f" {self.gpu_vendor}" if self.gpu_vendor else ""
-        return Panel(Group(t, bar), title=f"🎮 {label}{vend}",
-                     border_style="magenta")
+        return Panel(Group(t, bar), title=f"{icon} {label}{vend}",
+                     border_style=color)
 
     def _cpu_panel(self):
         from rich.panel import Panel
@@ -616,7 +689,7 @@ class _Dashboard:
             return _fmt(r.get("tok_s"))
         if col.id == "placement":
             p = r.get("placement") or "-"
-            return f"[{'green' if p == '100% GPU' else 'yellow'}]{p}[/]"
+            return f"[{'green' if p in ('100% GPU', '100% NPU') else 'yellow'}]{p}[/]"
         v = r.get(col.id)
         if v is None:
             return "-"
@@ -645,8 +718,9 @@ class _Dashboard:
         self.scroll = min(max(0, self.scroll), max_top)
         window = rows[self.scroll:self.scroll + visible]
 
+        cols = self._visible_columns()
         table = Table(expand=True, box=None, pad_edge=False)
-        for c in COLUMNS:
+        for c in cols:
             head = c.header
             if self.sort_key == c.id:
                 head = f"[bold]{c.header} {'▼' if self.sort_reverse else '▲'}[/]"
@@ -654,20 +728,20 @@ class _Dashboard:
             # column's justify to both), so nothing looks ragged.
             table.add_column(head, justify="left", style=c.style, no_wrap=True)
         for r in window:
-            table.add_row(*[self._cell(c, r) for c in COLUMNS])
+            table.add_row(*[self._cell(c, r) for c in cols])
 
         pos = f"{self.scroll + 1}-{self.scroll + len(window)}" if total else "0"
         follow = "[green]follow[/]" if self.follow else "[dim]manual[/]"
         title = f"✔ completed ({total})   rows {pos}   {follow}"
         if self.run_complete:
             legend = ("[dim]SHIFT+[/]"
-                      + " ".join(c.key for c in COLUMNS)
+                      + " ".join(c.key for c in cols)
                       + " [dim]sort · r reverse · ↑↓/jk scroll · g/b top/bottom · "
                         "f follow · p pause(copy)[/]"
                         "   [bold yellow]SHIFT+Q / q / CTRL+C[/] [dim]exit[/]")
         else:
             legend = ("[dim]SHIFT+[/]"
-                      + " ".join(c.key for c in COLUMNS)
+                      + " ".join(c.key for c in cols)
                       + " [dim]sort · r reverse · ↑↓/jk scroll · g/b top/bottom · "
                         "f follow · p pause(copy) · q quit[/]")
         return Panel(table, title=title, subtitle=legend, border_style="green")

@@ -7,7 +7,7 @@ import sys
 
 from .backends import PLATFORMS, make_backend
 from .client import DEFAULT_HOST
-from .runner import run
+from .runner import GEN_PROMPT, run
 from .ui import make_reporter
 
 
@@ -97,6 +97,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
+
+    shown_prompt = (prompt or GEN_PROMPT).strip().replace("\n", " ")
+    if len(shown_prompt) > 160:
+        shown_prompt = shown_prompt[:160] + "…"
+    print(f"[info] prompt: {shown_prompt}")
 
     reporter = make_reporter(args.ui, args.card)
     try:
